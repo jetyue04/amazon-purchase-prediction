@@ -20,10 +20,14 @@ def to_df(file):
     df = pd.DataFrame(rows)
     return df
 
-def prep_data(review_file, meta_file, save=True):
+def prep_data(review_files, meta_files, save=True):
     # Load JSONL files
-    reviews = to_df(review_file)
-    items = to_df(meta_file)
+    review_dfs = [to_df(f) for f in review_files]
+    reviews = pd.concat(review_dfs, ignore_index=True)
+
+    # Load and concatenate all meta files
+    item_dfs = [to_df(f) for f in meta_files]
+    items = pd.concat(item_dfs, ignore_index=True)
 
     # Time-based split
     cutoff = reviews["timestamp"].quantile(0.80)
@@ -54,8 +58,8 @@ def prep_data(review_file, meta_file, save=True):
 
 if __name__ == "__main__":
     # Default file names
-    review_file = "All_Beauty.jsonl.gz"
-    meta_file = "meta_All_Beauty.jsonl.gz"
+    review_file = ["All_Beauty.jsonl.gz"]
+    meta_file = ["meta_All_Beauty.jsonl.gz"]
     
     print(f"Processing review file: {review_file}")
     print(f"Processing meta file: {meta_file}")

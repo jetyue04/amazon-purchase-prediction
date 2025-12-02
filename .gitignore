@@ -210,3 +210,6 @@ __marimo__/
 data/
 *.jsonl
 *.csv
+
+#model files (too large for git)
+models/

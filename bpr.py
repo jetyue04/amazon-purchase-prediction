@@ -9,10 +9,14 @@ from tqdm import tqdm
 # ============================================================================
 # 1. LOAD DATA
 # ============================================================================
-train = pd.read_csv('data/train.csv')
-val = pd.read_csv('data/val.csv')
+train_full = pd.read_csv('data/train.csv')
+val_full = pd.read_csv('data/val.csv')
 test = pd.read_csv('data/test.csv')
 items = pd.read_csv('data/items.csv')
+
+# Use full datasets
+train = train_full  # Use full training set
+val = val_full  # Use full validation set
 
 print(f"Train: {len(train)} interactions")
 print(f"Val: {len(val)} interactions")
@@ -156,78 +160,15 @@ else:
     print("Using loaded model for evaluation.\n")
 
 # ============================================================================
-# 5. PREPROCESS VALIDATION DATA WITH NEGATIVES
+# 5. LOAD EVALUATION DATASET
 # ============================================================================
 
-def create_evaluation_dataset(val_df, all_items, user_to_items, num_negatives=99, seed=42):
-    """
-    Create evaluation dataset with negatives.
-    
-    Returns DataFrame with columns: user_id, item_id, label
-    - label=1 for actual interactions
-    - label=0 for negative samples
-    """
-    np.random.seed(seed)
-    all_items_array = np.array(all_items)
-    all_items_set = set(all_items)
-    
-    print(f"\nGenerating evaluation dataset with {num_negatives} negatives per positive...")
-    
-    # Pre-allocate lists for better performance
-    user_ids = []
-    item_ids = []
-    labels = []
-    
-    for idx, row in tqdm(val_df.iterrows(), total=len(val_df), desc="Creating eval dataset"):
-        user_id = row['user_id']
-        true_item = row['parent_asin']
-        
-        # Add positive example
-        user_ids.append(user_id)
-        item_ids.append(true_item)
-        labels.append(1)
-        
-        # Get items to exclude (user's training items)
-        exclude_items = user_to_items.get(user_id, set())
-        exclude_items.add(true_item)  # Also exclude the current validation item
-        
-        # Sample negatives - optimized version
-        available_items = all_items_set - exclude_items
-        num_available = len(available_items)
-        
-        if num_available > 0:
-            # Convert to numpy array for faster sampling
-            available_array = np.array(list(available_items))
-            sample_size = min(num_negatives, num_available)
-            
-            # Use numpy random choice (much faster)
-            negatives = np.random.choice(available_array, size=sample_size, replace=False)
-            
-            # Add negative examples
-            for neg_item in negatives:
-                user_ids.append(user_id)
-                item_ids.append(neg_item)
-                labels.append(0)
-    
-    # Create DataFrame from pre-allocated lists (much faster than appending dicts)
-    eval_df = pd.DataFrame({
-        'user_id': user_ids,
-        'item_id': item_ids,
-        'label': labels
-    })
-    
-    print(f"Created evaluation dataset: {len(eval_df)} rows")
-    print(f"  Positives: {eval_df['label'].sum()}")
-    print(f"  Negatives: {(eval_df['label'] == 0).sum()}")
-    
-    return eval_df
-
-# Build user_to_items mapping for evaluation
-user_to_items = train.groupby('user_id')['parent_asin'].apply(set).to_dict()
-all_items = train['parent_asin'].unique()
-
-# Create evaluation dataset
-eval_df = create_evaluation_dataset(val, all_items, user_to_items, num_negatives=99)
+# Load pre-computed evaluation dataset from data.py
+print("\nLoading evaluation dataset from data/eval_val.csv...")
+eval_df = pd.read_csv('data/eval_val.csv')
+print(f"Loaded evaluation dataset: {len(eval_df)} rows")
+print(f"  Positives: {eval_df['label'].sum()}")
+print(f"  Negatives: {(eval_df['label'] == 0).sum()}")
 
 # ============================================================================
 # 6. SCORING FUNCTION
@@ -278,23 +219,42 @@ def score_evaluation_dataset(eval_df):
 # Score the dataset
 eval_df = score_evaluation_dataset(eval_df)
 
+# Add tiny random tiebreaker to break score ties (important for cold-start users)
+np.random.seed(42)
+eval_df['score_tiebreaker'] = np.random.rand(len(eval_df)) * 1e-10
+eval_df['score_final'] = eval_df['score'] + eval_df['score_tiebreaker']
+
 # ============================================================================
 # 8. EVALUATION METRICS
 # ============================================================================
 
-def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100]):
+def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100, 200]):
     """
     Compute Hit Rate@K and MRR from scored evaluation dataset
     """
     results = {k: {'hits': 0} for k in k_values}
     reciprocal_ranks = []
     
+    # Track users in training vs cold-start
+    users_in_training = set(user_to_idx.keys())
+    users_in_training_count = 0
+    cold_start_count = 0
+    hits_in_training = {k: 0 for k in k_values}
+    hits_cold_start = {k: 0 for k in k_values}
+    
     print("\nComputing metrics...")
     
     # Group by user_id (each group has 1 positive + N negatives)
     for user_id, group in tqdm(eval_df.groupby('user_id'), desc="Computing metrics"):
-        # Sort by score descending
-        ranked = group.sort_values('score', ascending=False)
+        # Check if user is in training
+        is_in_training = user_id in users_in_training
+        if is_in_training:
+            users_in_training_count += 1
+        else:
+            cold_start_count += 1
+        
+        # Sort by score descending (use score_final to break ties randomly)
+        ranked = group.sort_values('score_final', ascending=False)
         
         # Get ranked item list
         ranked_items = ranked['item_id'].values
@@ -317,6 +277,10 @@ def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100]):
         for k in k_values:
             if true_rank <= k:
                 results[k]['hits'] += 1
+                if is_in_training:
+                    hits_in_training[k] += 1
+                else:
+                    hits_cold_start[k] += 1
     
     # Compute final metrics
     num_users = len(eval_df.groupby('user_id'))
@@ -325,14 +289,31 @@ def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100]):
     print("EVALUATION RESULTS")
     print("="*60)
     print(f"Total users evaluated: {num_users}")
+    print(f"  Users in training: {users_in_training_count} ({users_in_training_count/num_users*100:.2f}%)")
+    print(f"  Cold-start users: {cold_start_count} ({cold_start_count/num_users*100:.2f}%)")
     print()
     
+    print("Overall Metrics:")
     for k in k_values:
         hit_rate = results[k]['hits'] / num_users
         print(f"Hit Rate@{k:3d}: {hit_rate:.4f}")
     
     mrr = np.mean(reciprocal_ranks)
     print(f"\nMean Reciprocal Rank (MRR): {mrr:.4f}")
+    
+    # Breakdown by user type
+    if users_in_training_count > 0:
+        print(f"\nMetrics for users IN training ({users_in_training_count} users):")
+        for k in k_values:
+            hr = hits_in_training[k] / users_in_training_count
+            print(f"  Hit Rate@{k:3d}: {hr:.4f}")
+    
+    if cold_start_count > 0:
+        print(f"\nMetrics for COLD-START users ({cold_start_count} users):")
+        for k in k_values:
+            hr = hits_cold_start[k] / cold_start_count
+            print(f"  Hit Rate@{k:3d}: {hr:.4f}")
+    
     print("="*60)
     
     return results, mrr
@@ -341,7 +322,7 @@ def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100]):
 # 9. RUN EVALUATION
 # ============================================================================
 
-results, mrr = compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100])
+results, mrr = compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100, 200])
 
 # Save results
 output_file = os.path.join(model_dir, "bpr_evaluation_results.csv")

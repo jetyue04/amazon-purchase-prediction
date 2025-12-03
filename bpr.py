@@ -26,10 +26,20 @@ print(f"Items: {len(items)} items")
 # 2. HYPERPARAMETERS
 # ============================================================================
 embedding_dim = 50
-learning_rate = 0.01
-regularization = 0.01
-num_epochs = 5
-num_negatives = 5
+learning_rate = 0.05  # Increased from 0.01 for faster learning
+regularization = 0.001  # Decreased from 0.01 to allow stronger signals
+num_epochs = 15  # Increased from 5 for more training
+num_negatives = 10  # Increased from 5 for more training signal per positive
+
+print("\n" + "="*60)
+print("BPR HYPERPARAMETERS")
+print("="*60)
+print(f"Embedding dimension: {embedding_dim}")
+print(f"Learning rate: {learning_rate}")
+print(f"Regularization: {regularization}")
+print(f"Number of epochs: {num_epochs}")
+print(f"Negatives per positive: {num_negatives}")
+print("="*60 + "\n")
 
 # ============================================================================
 # 3. BUILD USER-ITEM MAPPINGS
@@ -64,6 +74,29 @@ for u_idx, items_set in positive_interactions.items():
 
 print(f"Positive interactions: {len(positive_pairs)}")
 
+# Build item popularity for cold-start fallback (like Popularity x Similarity model)
+item_counts = train['parent_asin'].value_counts()
+item_popularity = np.log1p(item_counts) / np.log1p(item_counts).max()
+print(f"Built popularity scores for {len(item_popularity)} items")
+
+# Build item-to-users mapping for Jaccard similarity (like Popularity x Similarity model)
+item_to_users = train.groupby('parent_asin')['user_id'].apply(set).to_dict()
+print(f"Built item-to-users mapping for {len(item_to_users)} items")
+
+# Build user-to-items mapping for similarity computation
+user_to_items = train.groupby('user_id')['parent_asin'].apply(set).to_dict()
+print(f"Built user-to-items mapping for {len(user_to_items)} users")
+
+def smooth_jaccard(item_i, item_j, alpha=0.01, beta=0.01):
+    """Compute smoothed Jaccard similarity between two items"""
+    users_i = item_to_users.get(item_i, set())
+    users_j = item_to_users.get(item_j, set())
+    if not users_i or not users_j:
+        return 0.0
+    intersection = len(users_i & users_j)
+    union = len(users_i | users_j)
+    return (intersection + alpha) / (union + beta)
+
 # ============================================================================
 # 4. LOAD OR TRAIN BPR MODEL
 # ============================================================================
@@ -73,8 +106,11 @@ user_emb_file = os.path.join(model_dir, "bpr_user_embeddings.npy")
 item_emb_file = os.path.join(model_dir, "bpr_item_embeddings.npy")
 mappings_file = os.path.join(model_dir, "bpr_mappings.pkl")
 
+# Set to True to force retraining (useful when hyperparameters change)
+FORCE_RETRAIN = False
+
 # Check if model exists and load it
-if os.path.exists(user_emb_file) and os.path.exists(item_emb_file) and os.path.exists(mappings_file):
+if not FORCE_RETRAIN and os.path.exists(user_emb_file) and os.path.exists(item_emb_file) and os.path.exists(mappings_file):
     print("\nLoading saved BPR model...")
     user_embeddings = np.load(user_emb_file)
     item_embeddings = np.load(item_emb_file)
@@ -90,6 +126,8 @@ if os.path.exists(user_emb_file) and os.path.exists(item_emb_file) and os.path.e
     print("Model loaded successfully! Skipping training.\n")
     skip_training = True
 else:
+    if FORCE_RETRAIN:
+        print("\nFORCE_RETRAIN=True: Retraining model with new hyperparameters...")
     # Initialize embeddings
     np.random.seed(42)
     user_embeddings = np.random.normal(0, 0.1, (num_users, embedding_dim))
@@ -193,25 +231,53 @@ def score_user_item(user_id, candidate_item):
 # 7. BATCH SCORING
 # ============================================================================
 
+def bpr_item_similarity(item_i, item_j):
+    """Compute similarity between items using BPR embeddings (cosine similarity)"""
+    if item_i not in item_to_idx or item_j not in item_to_idx:
+        return 0.0
+    
+    emb_i = item_embeddings[item_to_idx[item_i]]
+    emb_j = item_embeddings[item_to_idx[item_j]]
+    
+    # Cosine similarity
+    norm_i = np.linalg.norm(emb_i)
+    norm_j = np.linalg.norm(emb_j)
+    if norm_i == 0 or norm_j == 0:
+        return 0.0
+    
+    return np.dot(emb_i, emb_j) / (norm_i * norm_j)
+
+def score_user_item_enhanced(user_id, candidate_item):
+    """
+    Pure BPR scoring using item embeddings for similarity:
+    Score = popularity × bpr_item_similarity
+    """
+    # Get popularity score
+    pop_score = item_popularity.get(candidate_item, 0)
+    
+    # Cold-start user: use popularity only
+    if user_id not in user_to_items:
+        return pop_score
+    
+    user_items = user_to_items[user_id]
+    
+    # PURE BPR: Use only BPR item embedding similarity
+    bpr_sims = [bpr_item_similarity(candidate_item, item) for item in user_items]
+    mean_bpr_sim = np.mean(bpr_sims) if bpr_sims else 0.0
+    # Normalize to [0, 1] (cosine sim is [-1, 1])
+    mean_bpr_sim = (mean_bpr_sim + 1) / 2
+    
+    # Final score: popularity × BPR similarity
+    return pop_score * mean_bpr_sim
+
 def score_evaluation_dataset(eval_df):
-    """Score all user-item pairs in the evaluation dataset - vectorized"""
-    print("\nScoring evaluation dataset...")
+    """Score all user-item pairs in the evaluation dataset"""
+    print("\nScoring evaluation dataset with enhanced BPR similarity...")
+    scores = []
     
-    # Vectorized scoring - much faster!
-    # Get indices for all user-item pairs at once
-    user_indices = eval_df['user_id'].map(user_to_idx).fillna(-1).astype(int)
-    item_indices = eval_df['item_id'].map(item_to_idx).fillna(-1).astype(int)
-    
-    # Compute scores vectorized
-    scores = np.zeros(len(eval_df))
-    valid_mask = (user_indices >= 0) & (item_indices >= 0)
-    valid_user_idx = user_indices[valid_mask].values
-    valid_item_idx = item_indices[valid_mask].values
-    
-    # Vectorized dot product for valid pairs
-    if len(valid_user_idx) > 0:
-        valid_scores = np.sum(user_embeddings[valid_user_idx] * item_embeddings[valid_item_idx], axis=1)
-        scores[valid_mask] = valid_scores
+    for idx, row in tqdm(eval_df.iterrows(), total=len(eval_df), desc="Scoring"):
+        score = score_user_item_enhanced(row['user_id'], row['item_id'])
+        scores.append(score)
     
     eval_df['score'] = scores
     return eval_df
@@ -235,24 +301,10 @@ def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100, 200]):
     results = {k: {'hits': 0} for k in k_values}
     reciprocal_ranks = []
     
-    # Track users in training vs cold-start
-    users_in_training = set(user_to_idx.keys())
-    users_in_training_count = 0
-    cold_start_count = 0
-    hits_in_training = {k: 0 for k in k_values}
-    hits_cold_start = {k: 0 for k in k_values}
-    
     print("\nComputing metrics...")
     
     # Group by user_id (each group has 1 positive + N negatives)
     for user_id, group in tqdm(eval_df.groupby('user_id'), desc="Computing metrics"):
-        # Check if user is in training
-        is_in_training = user_id in users_in_training
-        if is_in_training:
-            users_in_training_count += 1
-        else:
-            cold_start_count += 1
-        
         # Sort by score descending (use score_final to break ties randomly)
         ranked = group.sort_values('score_final', ascending=False)
         
@@ -277,10 +329,6 @@ def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100, 200]):
         for k in k_values:
             if true_rank <= k:
                 results[k]['hits'] += 1
-                if is_in_training:
-                    hits_in_training[k] += 1
-                else:
-                    hits_cold_start[k] += 1
     
     # Compute final metrics
     num_users = len(eval_df.groupby('user_id'))
@@ -289,31 +337,14 @@ def compute_metrics(eval_df, k_values=[5, 10, 20, 50, 100, 200]):
     print("EVALUATION RESULTS")
     print("="*60)
     print(f"Total users evaluated: {num_users}")
-    print(f"  Users in training: {users_in_training_count} ({users_in_training_count/num_users*100:.2f}%)")
-    print(f"  Cold-start users: {cold_start_count} ({cold_start_count/num_users*100:.2f}%)")
     print()
     
-    print("Overall Metrics:")
     for k in k_values:
         hit_rate = results[k]['hits'] / num_users
         print(f"Hit Rate@{k:3d}: {hit_rate:.4f}")
     
     mrr = np.mean(reciprocal_ranks)
     print(f"\nMean Reciprocal Rank (MRR): {mrr:.4f}")
-    
-    # Breakdown by user type
-    if users_in_training_count > 0:
-        print(f"\nMetrics for users IN training ({users_in_training_count} users):")
-        for k in k_values:
-            hr = hits_in_training[k] / users_in_training_count
-            print(f"  Hit Rate@{k:3d}: {hr:.4f}")
-    
-    if cold_start_count > 0:
-        print(f"\nMetrics for COLD-START users ({cold_start_count} users):")
-        for k in k_values:
-            hr = hits_cold_start[k] / cold_start_count
-            print(f"  Hit Rate@{k:3d}: {hr:.4f}")
-    
     print("="*60)
     
     return results, mrr
